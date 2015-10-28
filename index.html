@@ -1,0 +1,408 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <title>Sky8 by wangfakang</title>
+
+    <link rel="stylesheet" href="stylesheets/styles.css">
+    <link rel="stylesheet" href="stylesheets/github-light.css">
+    <script src="javascripts/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+  </head>
+  <body>
+    <div class="wrapper">
+      <header>
+        <h1 class="header">Sky8</h1>
+        <p class="header">nginx least_conn load balancing algorithm </p>
+
+        <ul>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky8/zipball/master">Download ZIP</a></li>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky8/tarball/master">Download TAR</a></li>
+          <li><a class="buttons github" href="https://github.com/wangfakang/sky8">View On GitHub</a></li>
+        </ul>
+
+        <p class="header">This project is maintained by <a class="header name" href="https://github.com/wangfakang">wangfakang</a></p>
+
+
+      </header>
+      <section>
+        <p><code>nginx least_conn　算法的解析</code></p>
+
+<p>在之前的<a href="http://wangfakang.github.io/sky6">文章</a>讲解了nginx的round_robin.ip_hash.constent_hash的负载均衡算法，
+再后面的学习上接触到了least_conn今天抽时间补上，,该模块就是每次选择最少连接负载均衡算法，简单来说就是每次选择
+的都是当前最少连接的一个server(这个最少连接不是全局的，是每个进程都有自己的一个统计列表)。　</p>
+
+<p>看了这么多饿负载均衡算法，不知道你有什么体会（发现了没有?有很多的负载均衡都会去复用round_robin算法），
+是的优秀饿设计，的确很佩服．　　　</p>
+
+<p>首先来看如何打开least_conn模块:    </p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-c1">ngx_command_t</span>  ngx_http_upstream_least_conn_commands[] = {
+
+    { <span class="pl-c1">ngx_string</span>(<span class="pl-s"><span class="pl-pds">"</span>least_conn<span class="pl-pds">"</span></span>),
+      NGX_HTTP_UPS_CONF|NGX_CONF_NOARGS,
+      ngx_http_upstream_least_conn,
+      <span class="pl-c1">0</span>,
+      <span class="pl-c1">0</span>,
+      <span class="pl-c1">NULL</span> },
+
+      ngx_null_command
+};</pre></div>
+
+<p>可以看到命令很简单，就是在upstream块里面加上 least_conn就行了。   </p>
+
+<p>来看命令对应的回调，least_conn的入口就是在这个里面设置的.</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-k">char</span> *
+<span class="pl-en">ngx_http_upstream_least_conn</span>(<span class="pl-c1">ngx_conf_t</span> *cf, <span class="pl-c1">ngx_command_t</span> *cmd, <span class="pl-k">void</span> *conf)
+{
+    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span>  *uscf;
+
+    uscf = <span class="pl-c1">ngx_http_conf_get_module_srv_conf</span>(cf, ngx_http_upstream_module);
+
+    uscf-&gt;peer.<span class="pl-smi">init_upstream</span> = ngx_http_upstream_init_least_conn;
+
+    uscf-&gt;flags = NGX_HTTP_UPSTREAM_CREATE
+                  |NGX_HTTP_UPSTREAM_WEIGHT
+                  |NGX_HTTP_UPSTREAM_MAX_FAILS
+                  |NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
+                  |NGX_HTTP_UPSTREAM_DOWN
+                  |NGX_HTTP_UPSTREAM_BACKUP;
+
+    <span class="pl-k">return</span> NGX_CONF_OK;
+}</pre></div>
+
+<p>可以看到很简单，就是设置了peer.init_upstream,然后设置了支持的flags。那么这里就有问题了，
+peer.init_upstream什么时候会被调用呢。  </p>
+
+<p>upstream 进行相应饿初始化饿时候</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-k">char</span> *
+<span class="pl-en">ngx_http_upstream_init_main_conf</span>(<span class="pl-c1">ngx_conf_t</span> *cf, <span class="pl-k">void</span> *conf)
+{
+    <span class="pl-c1">ngx_http_upstream_main_conf_t</span>  *umcf = conf;
+
+    <span class="pl-c1">ngx_uint_t</span>                      i;
+    <span class="pl-c1">ngx_array_t</span>                     headers_in;
+    <span class="pl-c1">ngx_hash_key_t</span>                 *hk;
+    <span class="pl-c1">ngx_hash_init_t</span>                 hash;
+    ngx_http_upstream_init_pt       init;
+    <span class="pl-c1">ngx_http_upstream_header_t</span>     *header;
+    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span>  **uscfp;
+
+    uscfp = umcf-&gt;upstreams.<span class="pl-smi">elts</span>;
+
+    <span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; umcf-&gt;upstreams.<span class="pl-smi">nelts</span>; i++) {
+<span class="pl-c">//判断是否有设置 initupstream,默认是round robin算法.</span>
+        init = uscfp[i]-&gt;peer.<span class="pl-smi">init_upstream</span> ? uscfp[i]-&gt;peer.<span class="pl-smi">init_upstream</span>:
+                                            ngx_http_upstream_init_round_robin;
+
+        <span class="pl-k">if</span> (<span class="pl-c1">init</span>(cf, uscfp[i]) != NGX_OK) {
+            <span class="pl-k">return</span> NGX_CONF_ERROR;
+        }
+    }
+}
+</pre></div>
+
+<p>上面的代码可以看到是在解析upstream命令的时候，调用init_upstream的，因此也就可以这么说，init_upstream
+中初始化的的东西，每个进程都有自己的一份拷贝.（注意cow［写时拷贝技术］）</p>
+
+<p>所以我们来看ngx_http_upstream_init_least_conn，这个函数主要就是初始化round robin(主要是为了初始化权重
+等参数，而且least conn中如果多个server有相同的连接数，则会使用round robin算法)以及设置peer的init回调.</p>
+
+<p>还有一个要注意的就是conns数组［每个worker都有饿，不是全局饿］，这个数组每个slot保存了对应server的连接数</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-c1">ngx_int_t</span>
+<span class="pl-en">ngx_http_upstream_init_least_conn</span>(<span class="pl-c1">ngx_conf_t</span> *cf,
+    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span> *us)
+{
+    <span class="pl-c1">ngx_uint_t</span>                            n;
+    <span class="pl-c1">ngx_http_upstream_rr_peers_t</span>         *peers;
+    <span class="pl-c1">ngx_http_upstream_least_conn_conf_t</span>  *lcf;
+
+    <span class="pl-c1">ngx_log_debug0</span>(NGX_LOG_DEBUG_HTTP, cf-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                   <span class="pl-s"><span class="pl-pds">"</span>init least conn<span class="pl-pds">"</span></span>);
+<span class="pl-c">//初始化round robin</span>
+    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_init_round_robin</span>(cf, us) != NGX_OK) {
+        <span class="pl-k">return</span> NGX_ERROR;
+    }
+
+    peers = us-&gt;peer.<span class="pl-smi">data</span>;
+
+    n = peers-&gt;number;
+
+    <span class="pl-k">if</span> (peers-&gt;next) {
+        n += peers-&gt;next-&gt;number;
+    }
+
+    lcf = <span class="pl-c1">ngx_http_conf_upstream_srv_conf</span>(us,
+                                          ngx_http_upstream_least_conn_module);
+<span class="pl-c">//创建conns数组</span>
+    lcf-&gt;conns = <span class="pl-c1">ngx_pcalloc</span>(cf-&gt;pool, <span class="pl-k">sizeof</span>(<span class="pl-c1">ngx_uint_t</span>) * n);
+    <span class="pl-k">if</span> (lcf-&gt;conns == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span> NGX_ERROR;
+    }
+<span class="pl-c">//设置init</span>
+    us-&gt;peer.<span class="pl-smi">init</span> = ngx_http_upstream_init_least_conn_peer;
+
+    <span class="pl-k">return</span> NGX_OK;
+}
+
+而us-&gt;peer.init是在upstream的request初始化的时候调用的，也就是说每个request都会调用这个函数来初始化：
+
+
+<span class="pl-k">static</span> <span class="pl-k">void</span>
+<span class="pl-en">ngx_http_upstream_init_request</span>(<span class="pl-c1">ngx_http_request_t</span> *r)
+{
+
+found:
+
+    <span class="pl-k">if</span> (uscf-&gt;peer.<span class="pl-c1">init</span>(r, uscf) != NGX_OK) {
+        <span class="pl-c1">ngx_http_upstream_finalize_request</span>(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        <span class="pl-k">return</span>;
+    }
+
+    <span class="pl-c1">ngx_http_upstream_connect</span>(r, u);
+}
+
+然后我们就来看peer.init回调ngx_http_upstream_init_least_conn_peer，在这个函数中，主要是用来初始化对应的数据结构,
+然后挂载对应的回调(getpeer/freepeer).　　　
+
+
+<span class="pl-k">typedef</span> <span class="pl-k">struct</span> {
+    <span class="pl-c">/* the round robin data must be first */</span>
+    <span class="pl-c1">ngx_http_upstream_rr_peer_data_t</span>   rrp;
+<span class="pl-c">//连接信息保存</span>
+    <span class="pl-c1">ngx_uint_t</span>                        *conns;
+<span class="pl-c">//对应的get和free连接的回调</span>
+    ngx_event_get_peer_pt              get_rr_peer;
+    ngx_event_free_peer_pt             free_rr_peer;
+} <span class="pl-c1">ngx_http_upstream_lc_peer_data_t</span>;
+
+<span class="pl-k">static</span> <span class="pl-c1">ngx_int_t</span>
+<span class="pl-en">ngx_http_upstream_init_least_conn_peer</span>(<span class="pl-c1">ngx_http_request_t</span> *r,
+    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span> *us)
+{
+    <span class="pl-c1">ngx_http_upstream_lc_peer_data_t</span>     *lcp;
+    <span class="pl-c1">ngx_http_upstream_least_conn_conf_t</span>  *lcf;
+
+    <span class="pl-c1">ngx_log_debug0</span>(NGX_LOG_DEBUG_HTTP, r-&gt;connection-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                   <span class="pl-s"><span class="pl-pds">"</span>init least conn peer<span class="pl-pds">"</span></span>);
+
+    lcf = <span class="pl-c1">ngx_http_conf_upstream_srv_conf</span>(us,
+                                          ngx_http_upstream_least_conn_module);
+
+    lcp = <span class="pl-c1">ngx_palloc</span>(r-&gt;pool, <span class="pl-k">sizeof</span>(<span class="pl-c1">ngx_http_upstream_lc_peer_data_t</span>));
+    <span class="pl-k">if</span> (lcp == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span> NGX_ERROR;
+    }
+
+    lcp-&gt;conns = lcf-&gt;conns;
+
+    r-&gt;upstream-&gt;peer.<span class="pl-smi">data</span> = &amp;lcp-&gt;rrp;
+<span class="pl-c">//初始化round robin</span>
+    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_init_round_robin_peer</span>(r, us) != NGX_OK) {
+        <span class="pl-k">return</span> NGX_ERROR;
+    }
+<span class="pl-c">//设置回调</span>
+    r-&gt;upstream-&gt;peer.<span class="pl-smi">get</span> = ngx_http_upstream_get_least_conn_peer;
+    r-&gt;upstream-&gt;peer.<span class="pl-smi">free</span> = ngx_http_upstream_free_least_conn_peer;
+
+    lcp-&gt;get_rr_peer = ngx_http_upstream_get_round_robin_peer;
+    lcp-&gt;free_rr_peer = ngx_http_upstream_free_round_robin_peer;
+
+    <span class="pl-k">return</span> NGX_OK;
+}</pre></div>
+
+<p>上面可以看到每个lcp都有自己的get peer和free回调，这是什么原因呢，和upstream-&gt;peer的get和free的区别在哪里，
+这个是这样的原因，主要是least conn算法中，如果多个server都有相同的连接数，那么就需要使用round robin算法了，
+所以就保存了round robin的peer回调。　　　</p>
+
+<p>然后来看对应的peer get回调在那里调用的，首先通过前面的blog 我们知道每次当要和upstream建立连接的时候，
+我们都需要调用ngx_event_connect_peer，最终这个函数会创建连接，然后再去connect upstream，而我们的get
+回调也就是在这个函数中调用的。　　　　</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-c1">ngx_int_t</span>
+<span class="pl-en">ngx_event_connect_peer</span>(<span class="pl-c1">ngx_peer_connection_t</span> *pc)
+{
+    <span class="pl-k">int</span>                rc;
+    <span class="pl-c1">ngx_int_t</span>          event;
+    <span class="pl-c1">ngx_err_t</span>          err;
+    <span class="pl-c1">ngx_uint_t</span>         level;
+    <span class="pl-c1">ngx_socket_t</span>       s;
+    <span class="pl-c1">ngx_event_t</span>       *rev, *wev;
+    <span class="pl-c1">ngx_connection_t</span>  *c;
+<span class="pl-c">//调用get</span>
+    rc = pc-&gt;<span class="pl-c1">get</span>(pc, pc-&gt;data);
+    <span class="pl-k">if</span> (rc != NGX_OK) {
+        <span class="pl-k">return</span> rc;
+    }
+
+}</pre></div>
+
+<p>其实nginx的load balance模块中，最核心的就是peer.get回调了，基本上核心的算法都在get回调里面实现，所以我们来
+看ngx_http_upstream_get_least_conn_peer,首先是选择最少连接的server，这里要注意，其实不仅仅是最少连接，还要
+加上权重，这里nginx使用的是连接数和权重的乘积。［其实这里使用了一个交叉相乘的公式进行比较］</p>
+
+<p>还有一个要注意的，就是对于每一个请求，Nginx保存了一个位图，这个位图保存了所有server是否已经被当前request
+使用过的状态，如果使用过则对应的位是1，否则为0，这个主要是为了处理失败的情况，而重复进行连接。</p>
+
+<div class="highlight highlight-source-c"><pre>
+    <span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; peers-&gt;number; i++) {
+<span class="pl-c">//一个字节8位，所以计算当前peer所处的位置</span>
+        n = i / (<span class="pl-c1">8</span> * <span class="pl-k">sizeof</span>(<span class="pl-c1">uintptr_t</span>));
+<span class="pl-c">//得到当前peer的状态</span>
+        m = (<span class="pl-c1">uintptr_t</span>) <span class="pl-c1">1</span> &lt;&lt; i % (<span class="pl-c1">8</span> * <span class="pl-k">sizeof</span>(<span class="pl-c1">uintptr_t</span>));
+<span class="pl-c">//如果已经服务过，则跳过</span>
+        <span class="pl-k">if</span> (lcp-&gt;rrp.<span class="pl-smi">tried</span>[n] &amp; m) {
+            <span class="pl-k">continue</span>;
+        }
+
+        peer = &amp;peers-&gt;peer[i];
+
+        <span class="pl-k">if</span> (peer-&gt;down) {
+            <span class="pl-k">continue</span>;
+        }
+<span class="pl-c">//如果超过最大失败次数，并且还没超时，则跳过.</span>
+        <span class="pl-k">if</span> (peer-&gt;max_fails
+            &amp;&amp; peer-&gt;fails &gt;= peer-&gt;max_fails
+            &amp;&amp; now - peer-&gt;checked &lt;= peer-&gt;fail_timeout)
+        {
+            <span class="pl-k">continue</span>;
+        }
+
+        <span class="pl-c">/*</span>
+<span class="pl-c">         * select peer with least number of connections; if there are</span>
+<span class="pl-c">         * multiple peers with the same number of connections, select</span>
+<span class="pl-c">         * based on round-robin</span>
+<span class="pl-c">         */</span>
+<span class="pl-c">//选择server</span>
+        <span class="pl-k">if</span> (best == <span class="pl-c1">NULL</span>
+            || lcp-&gt;conns[i] * best-&gt;weight &lt; lcp-&gt;conns[p] * peer-&gt;weight)
+        {
+            best = peer;
+<span class="pl-c">//many表示是否有多个server满足条件.</span>
+            many = <span class="pl-c1">0</span>;
+<span class="pl-c">//p为best的位置</span>
+            p = i;
+
+        } <span class="pl-k">else</span> <span class="pl-k">if</span> (lcp-&gt;conns[i] * best-&gt;weight
+                   == lcp-&gt;conns[p] * peer-&gt;weight)
+        {
+<span class="pl-c">//相等则说明有多个server满足条件.</span>
+            many = <span class="pl-c1">1</span>;
+        }
+    }
+
+接下来这段就是当有多个server满足条件的时候的处理，这里是如果多个server满足条件，则进入round robin的处理逻辑。
+下面的代码和round robin的get peer回调中算法是一模一样的。就是根据权重选择一个合适的server，这里Nginx还调整过
+round robin算法．
+
+
+
+<span class="pl-k">if</span> (many) {
+    <span class="pl-c1">ngx_log_debug0</span>(NGX_LOG_DEBUG_HTTP, pc-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                   <span class="pl-s"><span class="pl-pds">"</span>get least conn peer, many<span class="pl-pds">"</span></span>);
+
+    <span class="pl-k">for</span> (i = p; i &lt; peers-&gt;number; i++) {
+
+        n = i / (<span class="pl-c1">8</span> * <span class="pl-k">sizeof</span>(<span class="pl-c1">uintptr_t</span>));
+        m = (<span class="pl-c1">uintptr_t</span>) <span class="pl-c1">1</span> &lt;&lt; i % (<span class="pl-c1">8</span> * <span class="pl-k">sizeof</span>(<span class="pl-c1">uintptr_t</span>));
+
+        <span class="pl-k">if</span> (lcp-&gt;rrp.<span class="pl-smi">tried</span>[n] &amp; m) {
+            <span class="pl-k">continue</span>;
+        }
+
+        peer = &amp;peers-&gt;peer[i];
+
+        <span class="pl-k">if</span> (peer-&gt;down) {
+            <span class="pl-k">continue</span>;
+        }
+
+        <span class="pl-k">if</span> (lcp-&gt;conns[i] * best-&gt;weight != lcp-&gt;conns[p] * peer-&gt;weight) {
+            <span class="pl-k">continue</span>;
+        }
+
+        <span class="pl-k">if</span> (peer-&gt;max_fails
+            &amp;&amp; peer-&gt;fails &gt;= peer-&gt;max_fails
+            &amp;&amp; now - peer-&gt;checked &lt;= peer-&gt;fail_timeout)
+        {
+            <span class="pl-k">continue</span>;
+        }
+
+        peer-&gt;current_weight += peer-&gt;effective_weight;
+        total += peer-&gt;effective_weight;
+
+        <span class="pl-k">if</span> (peer-&gt;effective_weight &lt; peer-&gt;weight) {
+            peer-&gt;effective_weight++;
+        }
+
+        <span class="pl-k">if</span> (peer-&gt;current_weight &gt; best-&gt;current_weight) {
+            best = peer;
+            p = i;
+        }
+    }
+}
+
+best-&gt;current_weight -= total;
+best-&gt;checked = now;</pre></div>
+
+<p>最后就是更新一些状态位，比如更新server的连接数 等　　</p>
+
+<p>最后回顾下：　　
+ (1).该模块其实就是每次选择连接数最少(当然还和自己当前的权值相关,其实是当前连接数除以自己的权重的值作比较,
+ 看谁小就选择谁.但是权值有可能是 0,所以做了等价对换,即交叉相乘)的server,其中有一个全局的conns数组用于记录
+ 每个server的连接 数.　　　　　　
+ (2).还有就是一种情况,当出现了多个server都满足条件的时候,则此时采用round_robin.　　　　　　　</p>
+
+<h1>
+<a id="欢迎一起交流学习-" class="anchor" href="#%E6%AC%A2%E8%BF%8E%E4%B8%80%E8%B5%B7%E4%BA%A4%E6%B5%81%E5%AD%A6%E4%B9%A0-" aria-hidden="true"><span class="octicon octicon-link"></span></a>欢迎一起交流学习 </h1>
+
+<p>在使用中有任何问题，欢迎反馈给我，可以用以下联系方式跟我交流</p>
+
+<ul>
+<li>邮件(1031379296#qq.com, 把#换成@)</li>
+<li>QQ: 1031379296</li>
+<li>weibo: <a href="http://weibo.com/u/2786211992/home">@王发康</a>
+</li>
+</ul>
+
+<h1>
+<a id="thx" class="anchor" href="#thx" aria-hidden="true"><span class="octicon octicon-link"></span></a>Thx</h1>
+
+<ul>
+<li>chunshengsterATgmail.com</li>
+</ul>
+
+<h1>
+<a id="author" class="anchor" href="#author" aria-hidden="true"><span class="octicon octicon-link"></span></a>Author</h1>
+
+<ul>
+<li>Linux\nginx\golang\c\c++爱好者</li>
+<li>欢迎一起交流  一起学习# </li>
+<li>Others say good and Others good</li>
+</ul>
+      </section>
+      <footer>
+        <p><small>Hosted on <a href="https://pages.github.com">GitHub Pages</a> using the Dinky theme</small></p>
+      </footer>
+    </div>
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+		          <script type="text/javascript">
+            var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
+            document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+          </script>
+          <script type="text/javascript">
+            try {
+              var pageTracker = _gat._getTracker("nginx least_conn load balancing algorithm ");
+            pageTracker._trackPageview();
+            } catch(err) {}
+          </script>
+
+  </body>
+</html>
